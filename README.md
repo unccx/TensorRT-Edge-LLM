@@ -23,6 +23,80 @@ TensorRT Edge-LLM is NVIDIA's high-performance C++ inference runtime for Large L
 
 For the supported platforms, models and precisions, see the [**Overview**](https://nvidia.github.io/TensorRT-Edge-LLM/latest/developer_guide/getting-started/overview.html). Get started with TensorRT Edge-LLM in <15 minutes. For complete installation and usage instructions, see the [**Quick Start Guide**](https://nvidia.github.io/TensorRT-Edge-LLM/latest/developer_guide/getting-started/quick-start-guide.html).
 
+### Internal Packaging for Bazel `http_archive`
+
+This repository includes `package_http_archive.sh` to package runtime libraries and headers into an archive for Bazel `http_archive` consumption.
+
+Default behavior:
+- Output layout: `include/tensorrt-edge-llm/**` and `lib/**`
+- Includes all `.so/.so.*` and `.a` from `build/`
+- Excludes `libexampleUtils.a` by default
+- Preserves `.so` symlink chain and verifies links after extraction
+- Prints archive path and `sha256`
+- Uses bundle prefix `tensorrt-edge-llm-<arch>` where `arch` defaults to `x86_64`
+
+Run in Docker (recommended in this workspace):
+
+```bash
+docker exec -u qcraft qcraft_dev_qcraft bash -lc \
+  'bash /hosthome/Dev/TensorRT-Edge-LLM/package_http_archive.sh \
+    --project-dir /hosthome/Dev/TensorRT-Edge-LLM \
+    --output-dir /hosthome/Dev/TensorRT-Edge-LLM'
+```
+
+Include `libexampleUtils.a` only when needed:
+
+```bash
+docker exec -u qcraft qcraft_dev_qcraft bash -lc \
+  'bash /hosthome/Dev/TensorRT-Edge-LLM/package_http_archive.sh \
+    --project-dir /hosthome/Dev/TensorRT-Edge-LLM \
+    --output-dir /hosthome/Dev/TensorRT-Edge-LLM \
+    --include-example-utils'
+```
+
+Package for another architecture tag (for example `aarch64`):
+
+```bash
+docker exec -u qcraft qcraft_dev_qcraft bash -lc \
+  'bash /hosthome/Dev/TensorRT-Edge-LLM/package_http_archive.sh \
+    --project-dir /hosthome/Dev/TensorRT-Edge-LLM \
+    --output-dir /hosthome/Dev/TensorRT-Edge-LLM \
+    --arch aarch64'
+```
+
+`WORKSPACE` snippet (same style as existing third-party archives):
+
+```python
+load("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
+
+tensorrt_edge_llm_arch = "x86_64"
+tensorrt_edge_llm_package_version = "x86_64_<timestamp-from-bundle-name>"
+
+http_archive(
+    name = "tensorrt_edge_llm_{}".format(tensorrt_edge_llm_arch),
+    build_file = clean_dep("//third_party/tensorrt_edge_llm:tensorrt_edge_llm.{}.BUILD".format(tensorrt_edge_llm_arch)),
+    sha256 = "<sha256-from-package-script>",
+    urls = [
+        "https://<your-oss-url>/tensorrt-edge-llm-{}.tar.gz".format(tensorrt_edge_llm_package_version),
+    ],
+    strip_prefix = "tensorrt-edge-llm-{}".format(tensorrt_edge_llm_package_version),
+)
+```
+
+To match this naming, package with:
+`--arch <x86_64|aarch64|...>`
+
+If your workspace does not define `clean_dep`, use a plain label string for `build_file` instead.
+
+Then in your Bazel target:
+
+```python
+deps = [
+    "@tensorrt_edge_llm_<arch>//:headers",
+    "@tensorrt_edge_llm_<arch>//:edgellm_plugin_so",
+]
+```
+
 ---
 
 ## Documentation

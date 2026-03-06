@@ -12,6 +12,8 @@ data/
 data.tar
 *.csv
 *.tar.gz
+tensorrt-edge-llm-aarch64*
+tensorrt-edge-llm-x86_64*
 internal/
 *.log
 .DS_Store/
