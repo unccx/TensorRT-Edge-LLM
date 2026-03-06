@@ -136,7 +136,7 @@ LLMEngineRunner::LLMEngineRunner(std::filesystem::path const& enginePath, std::f
     auto mmapReader = std::make_unique<file_io::MmapReader>(enginePath);
     if (mmapReader->getData() == nullptr)
     {
-        LOG_ERROR("LLMEngineRunner(): Failed to use MMap to read engine from file path: %s", enginePath.string());
+        LOG_ERROR("LLMEngineRunner(): Failed to use MMap to read engine from file path: %s", enginePath.string().c_str());
         throw std::runtime_error("Failed to use MMap to read engine from file path: " + enginePath.string());
     }
     mEngine = std::unique_ptr<nvinfer1::ICudaEngine>(

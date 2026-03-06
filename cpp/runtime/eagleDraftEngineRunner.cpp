@@ -127,7 +127,7 @@ EagleDraftEngineRunner::EagleDraftEngineRunner(
     auto mmapReader = std::make_unique<file_io::MmapReader>(enginePath);
     if (mmapReader->getData() == nullptr)
     {
-        LOG_ERROR("Failed to use MMap to read engine from file path: %s", enginePath.string());
+        LOG_ERROR("Failed to use MMap to read engine from file path: %s", enginePath.string().c_str());
         throw std::runtime_error("Failed to use MMap to read engine from file path: " + enginePath.string());
     }
 

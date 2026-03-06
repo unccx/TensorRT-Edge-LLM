@@ -243,7 +243,7 @@ bool QwenViTRunner::allocateBuffer(cudaStream_t stream)
     }
 
     // Copy image mean and std to device to be used in normalizeImage
-    auto channels = mConfig.imageMean.size();
+    auto channels = static_cast<int64_t>(mConfig.imageMean.size());
     mImageMean = rt::Tensor({channels}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT, "QwenViTRunner::mImageMean");
     mImageStd = rt::Tensor({channels}, rt::DeviceType::kGPU, nvinfer1::DataType::kFLOAT, "QwenViTRunner::mImageStd");
     CUDA_CHECK(cudaMemcpyAsync(
@@ -314,7 +314,8 @@ void QwenViTRunner::formatPatch(rt::imageUtils::ImageData const& image,
     auto imageSize = height * width * channels;
     for (int64_t i = 0; i < mConfig.temporalPatchSize; ++i)
     {
-        CUDA_CHECK(cudaMemcpyAsync(mImageDevice.rawPointer() + i * imageSize * sizeof(unsigned char), imageData,
+        auto* imageDevicePtr = static_cast<unsigned char*>(mImageDevice.rawPointer());
+        CUDA_CHECK(cudaMemcpyAsync(imageDevicePtr + i * imageSize * sizeof(unsigned char), imageData,
             imageSize * sizeof(unsigned char), cudaMemcpyHostToDevice, stream));
     }
 
