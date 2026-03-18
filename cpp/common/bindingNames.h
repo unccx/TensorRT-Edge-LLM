@@ -280,6 +280,13 @@ inline constexpr char const* kWindowIndex = "window_index";
 inline constexpr char const* kReverseWindowIndex = "reverse_window_index";
 
 /*!
+ * @brief Window attention mask for Qwen2.5-VL sliding window attention
+ *
+ * Shape: [1, num_attention_elems, num_attention_elems] (FLOAT16)
+ */
+inline constexpr char const* kWindowAttentionMask = "window_attention_mask";
+
+/*!
  * @brief Fast position embeddings index tensor for Qwen3-VL vision model
  *
  * Shape: [4, sequence_length] (INT64)

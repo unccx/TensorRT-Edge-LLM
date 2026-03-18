@@ -77,10 +77,10 @@ struct AlibiParams
 //!
 //! An opaque 64-byte aligned structure used for TensorRT Memory Accelerator descriptors
 //! \cond INTERNAL
-typedef struct alignas(64)
+struct alignas(64) cudaTmaDesc
 {
     uint64_t data[8] = {};
-} cudaTmaDesc;
+};
 //! \endcond
 
 //! \brief Array structure for managing paged KV cache blocks

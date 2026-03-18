@@ -79,7 +79,7 @@ constexpr int32_t kNUM_REQUIRED_OUTPUTS{2};
 
 // Support Tree Attention decoding schema up to 128 tokens in the draft tree per batch.
 // We are unable to check this property during shape checking since prefill length is much larger than this value.
-constexpr int64_t kMAX_EAGLE_DECODING_TOKENS = 128;
+[[maybe_unused]] constexpr int64_t kMAX_EAGLE_DECODING_TOKENS = 128;
 
 enum class AttentionExecutionMode
 {
@@ -369,7 +369,7 @@ bool AttentionPlugin::supportsFormatCombination(
         return status;
     };
 
-    auto checkSequenceLen = [this](nvinfer1::PluginTensorDesc const& tensorDesc) {
+    auto checkSequenceLen = [](nvinfer1::PluginTensorDesc const& tensorDesc) {
         bool status{true};
         status &= tensorDesc.type == DataType::kINT32;
         status &= tensorDesc.format == TensorFormat::kLINEAR;
@@ -386,7 +386,7 @@ bool AttentionPlugin::supportsFormatCombination(
         return status;
     };
 
-    auto checkAttentionMask = [this](nvinfer1::PluginTensorDesc const& tensorDesc) {
+    auto checkAttentionMask = [](nvinfer1::PluginTensorDesc const& tensorDesc) {
         bool status{true};
         status &= tensorDesc.type == DataType::kINT32;
         status &= tensorDesc.format == TensorFormat::kLINEAR;
@@ -394,7 +394,7 @@ bool AttentionPlugin::supportsFormatCombination(
         return status;
     };
 
-    auto checkAttentionPosId = [this](nvinfer1::PluginTensorDesc const& tensorDesc) {
+    auto checkAttentionPosId = [](nvinfer1::PluginTensorDesc const& tensorDesc) {
         bool status{true};
         status &= tensorDesc.type == DataType::kINT32;
         status &= tensorDesc.format == TensorFormat::kLINEAR;
@@ -402,7 +402,7 @@ bool AttentionPlugin::supportsFormatCombination(
         return status;
     };
 
-    auto checkKVCacheStartIdx = [this](nvinfer1::PluginTensorDesc const& tensorDesc) {
+    auto checkKVCacheStartIdx = [](nvinfer1::PluginTensorDesc const& tensorDesc) {
         bool status{true};
         status &= tensorDesc.type == DataType::kINT32;
         status &= tensorDesc.format == TensorFormat::kLINEAR;

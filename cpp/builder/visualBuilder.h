@@ -154,8 +154,8 @@ private:
     int64_t mNumChannels{0};   //!< Number of input channels
     int64_t mImageSizeH{0};    //!< Image height
     int64_t mImageSizeW{0};    //!< Image width
-    int64_t mInputDim{0};      //!< Input dimension for Qwen models
-    int64_t mRopeEmbedSize{0}; //!< Rotary position embedding size
+    [[maybe_unused]] int64_t mInputDim{0};      //!< Input dimension for Qwen models
+    [[maybe_unused]] int64_t mRopeEmbedSize{0}; //!< Rotary position embedding size
     Json mModelConfig;         //!< Parsed model configuration
 };
 

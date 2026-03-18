@@ -1,4 +1,7 @@
 build/
+venv/
+tensorrt-edge-llm-x86_64*/
+tensorrt-edge-llm-aarch64*/
 dist/
 *.egg-info
 *_engine/

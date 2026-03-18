@@ -210,7 +210,7 @@ bool ViTAttentionPlugin::supportsFormatCombination(
         return status;
     };
 
-    auto checkCuSeqLens = [this](nvinfer1::PluginTensorDesc const& tensorDesc) {
+    auto checkCuSeqLens = [](nvinfer1::PluginTensorDesc const& tensorDesc) {
         bool status{true};
         status &= tensorDesc.type == DataType::kINT32;
         status &= tensorDesc.format == TensorFormat::kLINEAR;
@@ -218,7 +218,7 @@ bool ViTAttentionPlugin::supportsFormatCombination(
         return status;
     };
 
-    auto checkMaxSeqLenCarrier = [this](nvinfer1::PluginTensorDesc const& tensorDesc) {
+    auto checkMaxSeqLenCarrier = [](nvinfer1::PluginTensorDesc const& tensorDesc) {
         bool status{true};
         status &= tensorDesc.type == DataType::kINT32;
         status &= tensorDesc.format == TensorFormat::kLINEAR;

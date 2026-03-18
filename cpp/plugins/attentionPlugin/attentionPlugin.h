@@ -142,7 +142,7 @@ public:
 
     //! \brief Set plugin namespace
     //! \param[in] pluginNamespace Namespace to set
-    void setPluginNamespace(char const* pluginNamespace) noexcept;
+    void setPluginNamespace(char const* pluginNamespace) noexcept override;
 
     //! \brief Get plugin version
     //! \return Plugin version string
@@ -208,7 +208,7 @@ public:
 
     //! \brief Set plugin namespace
     //! \param[in] pluginNamespace Namespace to set
-    void setPluginNamespace(char const* pluginNamespace) noexcept;
+    void setPluginNamespace(char const* pluginNamespace) noexcept override;
 
     //! \brief Get plugin namespace
     //! \return Plugin namespace string
