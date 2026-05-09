@@ -172,8 +172,9 @@ void selectiveStateUpdateMultiStepReferenceFp32(
     std::vector<half> const* dtBias,    // [nheads] (optional, half)
     std::vector<half> const* z,         // [batch, seqLen, nheads, dim] (optional)
     bool dtSoftplus,
-    std::vector<half>& outputRef, // [batch, seqLen, nheads, dim]
-    std::vector<half>& stateRef   // [batch, nheads, dim, dstate]
+    std::vector<half>& outputRef,                     // [batch, seqLen, nheads, dim]
+    std::vector<half>& stateRef,                      // [batch, nheads, dim, dstate]
+    std::vector<int32_t> const* contextLens = nullptr // [batch] (optional)
 )
 {
     int32_t const headsPerGroup = nheads / ngroups;
@@ -186,6 +187,15 @@ void selectiveStateUpdateMultiStepReferenceFp32(
     {
         for (int32_t b = 0; b < batch; ++b)
         {
+            int32_t const cl = contextLens ? (*contextLens)[b] : seqLen;
+            if (t >= cl)
+            {
+                for (int32_t h = 0; h < nheads; ++h)
+                    for (int32_t d = 0; d < dim; ++d)
+                        outputRef[b * seqLen * nheads * dim + t * nheads * dim + h * dim + d] = __float2half(0.f);
+                continue;
+            }
+
             for (int32_t h = 0; h < nheads; ++h)
             {
                 int32_t const group = h / headsPerGroup;
@@ -437,33 +447,28 @@ void runMambaSelectiveStateUpdateTest(MambaTestConfig const& config)
     rt::Tensor dtBiasDevice;
     rt::Tensor zDevice;
 
-    CUDA_CHECK(cudaMemcpy(stateDevice.rawPointer(), stateHostForGpu.data(), stateHostForGpu.size() * sizeof(half),
-        cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(
-        xDevice.rawPointer(), xHostForGpu.data(), xHostForGpu.size() * sizeof(half), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(dtDevice.rawPointer(), dtHost.data(), dtHost.size() * sizeof(float), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(ADevice.rawPointer(), AHost.data(), AHost.size() * sizeof(float), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(BDevice.rawPointer(), BHost.data(), BHost.size() * sizeof(half), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(CDevice.rawPointer(), CHost.data(), CHost.size() * sizeof(half), cudaMemcpyHostToDevice));
+    copyHostToDevice<half>(stateDevice, stateHostForGpu);
+    copyHostToDevice<half>(xDevice, xHostForGpu);
+    copyHostToDevice<float>(dtDevice, dtHost);
+    copyHostToDevice<float>(ADevice, AHost);
+    copyHostToDevice<half>(BDevice, BHost);
+    copyHostToDevice<half>(CDevice, CHost);
     CUDA_CHECK(cudaMemset(outputDevice.rawPointer(), 0, outputDevice.getMemoryCapacity()));
 
     if (config.useSkipConnection)
     {
         DDevice = rt::Tensor({nheads}, rt::DeviceType::kGPU, DataType::kFLOAT);
-        CUDA_CHECK(
-            cudaMemcpy(DDevice.rawPointer(), DHost.data(), DHost.size() * sizeof(float), cudaMemcpyHostToDevice));
+        copyHostToDevice<float>(DDevice, DHost);
     }
     if (config.useDtBias)
     {
         dtBiasDevice = rt::Tensor({nheads}, rt::DeviceType::kGPU, DataType::kFLOAT);
-        CUDA_CHECK(cudaMemcpy(
-            dtBiasDevice.rawPointer(), dtBiasHost.data(), dtBiasHost.size() * sizeof(float), cudaMemcpyHostToDevice));
+        copyHostToDevice<float>(dtBiasDevice, dtBiasHost);
     }
     if (config.useSiluGating)
     {
         zDevice = rt::Tensor({batch, nheads, paddedDim}, rt::DeviceType::kGPU, DataType::kHALF);
-        CUDA_CHECK(cudaMemcpy(
-            zDevice.rawPointer(), zHostForGpu.data(), zHostForGpu.size() * sizeof(half), cudaMemcpyHostToDevice));
+        copyHostToDevice<half>(zDevice, zHostForGpu);
     }
 
     if (usePaddedDstate)
@@ -502,12 +507,8 @@ void runMambaSelectiveStateUpdateTest(MambaTestConfig const& config)
         outputDevice, config.dtSoftplus, stream);
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
-    std::vector<half> outputFromGpu(outputGpuSize);
-    std::vector<half> stateResultFromGpu(stateHostForGpu.size());
-    CUDA_CHECK(cudaMemcpy(
-        outputFromGpu.data(), outputDevice.rawPointer(), outputFromGpu.size() * sizeof(half), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(stateResultFromGpu.data(), stateDevice.rawPointer(), stateResultFromGpu.size() * sizeof(half),
-        cudaMemcpyDeviceToHost));
+    auto const outputFromGpu = copyDeviceToHost<half>(outputDevice);
+    auto const stateResultFromGpu = copyDeviceToHost<half>(stateDevice);
 
     // Convert results from padded to contiguous for comparison if needed
     std::vector<half> outputHost;
@@ -747,7 +748,8 @@ TEST(MambaSelectiveStateUpdate, PaddedBoth_Dim80to128_Dstate80to128)
 // same result as calling the reference one step at a time.
 // =============================================================================
 
-void runMambaMultiStepTest(MambaTestConfig const& config, int32_t seqLen)
+void runMambaMultiStepTest(
+    MambaTestConfig const& config, int32_t seqLen, std::vector<int32_t> const* contextLens = nullptr)
 {
     cudaStream_t stream{nullptr};
 
@@ -791,7 +793,7 @@ void runMambaMultiStepTest(MambaTestConfig const& config, int32_t seqLen)
     selectiveStateUpdateMultiStepReferenceFp32(batch, nheads, dim, dstate, ngroups, seqLen, stateHostInit, xHost,
         dtHost, AHost, BHost, CHost, config.useSkipConnection ? &DHost : nullptr,
         config.useDtBias ? &dtBiasHost : nullptr, config.useSiluGating ? &zHost : nullptr, config.dtSoftplus, refOutput,
-        refState);
+        refState, contextLens);
 
     auto stateDevice = rt::Tensor({batch, nheads, dim, dstate}, rt::DeviceType::kGPU, DataType::kHALF);
     auto xDevice = rt::Tensor({batch, seqLen, nheads, dim}, rt::DeviceType::kGPU, DataType::kHALF);
@@ -804,30 +806,28 @@ void runMambaMultiStepTest(MambaTestConfig const& config, int32_t seqLen)
     rt::Tensor dtBiasDevice;
     rt::Tensor zDevice;
 
-    CUDA_CHECK(
-        cudaMemcpy(stateDevice.rawPointer(), stateHostInit.data(), stateSize * sizeof(half), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(xDevice.rawPointer(), xHost.data(), xSize * sizeof(half), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(dtDevice.rawPointer(), dtHost.data(), dtHost.size() * sizeof(half), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(ADevice.rawPointer(), AHost.data(), AHost.size() * sizeof(float), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(BDevice.rawPointer(), BHost.data(), BHost.size() * sizeof(half), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(CDevice.rawPointer(), CHost.data(), CHost.size() * sizeof(half), cudaMemcpyHostToDevice));
+    copyHostToDevice<half>(stateDevice, stateHostInit);
+    copyHostToDevice<half>(xDevice, xHost);
+    copyHostToDevice<half>(dtDevice, dtHost);
+    copyHostToDevice<float>(ADevice, AHost);
+    copyHostToDevice<half>(BDevice, BHost);
+    copyHostToDevice<half>(CDevice, CHost);
     CUDA_CHECK(cudaMemset(outputDevice.rawPointer(), 0, outputDevice.getMemoryCapacity()));
 
     if (config.useSkipConnection)
     {
         DDevice = rt::Tensor({nheads}, rt::DeviceType::kGPU, DataType::kHALF);
-        CUDA_CHECK(cudaMemcpy(DDevice.rawPointer(), DHost.data(), DHost.size() * sizeof(half), cudaMemcpyHostToDevice));
+        copyHostToDevice<half>(DDevice, DHost);
     }
     if (config.useDtBias)
     {
         dtBiasDevice = rt::Tensor({nheads}, rt::DeviceType::kGPU, DataType::kHALF);
-        CUDA_CHECK(cudaMemcpy(
-            dtBiasDevice.rawPointer(), dtBiasHost.data(), dtBiasHost.size() * sizeof(half), cudaMemcpyHostToDevice));
+        copyHostToDevice<half>(dtBiasDevice, dtBiasHost);
     }
     if (config.useSiluGating)
     {
         zDevice = rt::Tensor({batch, seqLen, nheads, dim}, rt::DeviceType::kGPU, DataType::kHALF);
-        CUDA_CHECK(cudaMemcpy(zDevice.rawPointer(), zHost.data(), xSize * sizeof(half), cudaMemcpyHostToDevice));
+        copyHostToDevice<half>(zDevice, zHost);
     }
 
     namespace rt = trt_edgellm::rt;
@@ -835,15 +835,22 @@ void runMambaMultiStepTest(MambaTestConfig const& config, int32_t seqLen)
     rt::OptionalInputTensor DOpt = DDevice.isEmpty() ? std::nullopt : std::optional(std::cref(DDevice));
     rt::OptionalInputTensor zOpt = zDevice.isEmpty() ? std::nullopt : std::optional(std::cref(zDevice));
 
+    rt::Tensor clDevice;
+    if (contextLens)
+    {
+        clDevice = rt::Tensor({batch}, rt::DeviceType::kGPU, DataType::kINT32);
+        CUDA_CHECK(cudaMemcpy(
+            clDevice.rawPointer(), contextLens->data(), contextLens->size() * sizeof(int32_t), cudaMemcpyHostToDevice));
+    }
+    rt::OptionalInputTensor clOpt = clDevice.isEmpty() ? std::nullopt : std::optional(std::cref(clDevice));
+
     invokeSelectiveStateUpdatePrefill(xDevice, ADevice, BDevice, CDevice, dtDevice, dtBiasOpt, DOpt, zOpt, stateDevice,
-        outputDevice, config.dtSoftplus, stream);
+        outputDevice, config.dtSoftplus, clOpt, stream);
 
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
-    std::vector<half> gpuOutput(xSize);
-    std::vector<half> gpuState(stateSize);
-    CUDA_CHECK(cudaMemcpy(gpuOutput.data(), outputDevice.rawPointer(), xSize * sizeof(half), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(gpuState.data(), stateDevice.rawPointer(), stateSize * sizeof(half), cudaMemcpyDeviceToHost));
+    auto const gpuOutput = copyDeviceToHost<half>(outputDevice);
+    auto const gpuState = copyDeviceToHost<half>(stateDevice);
 
     auto [rtol, atol] = getTolerance<half>();
     int32_t outputMismatches = 0;
@@ -925,4 +932,36 @@ TEST(MambaSelectiveStateUpdate, MultiStep_NemotronLike_SeqLen8)
     config.useDtBias = true;
     config.dtSoftplus = true;
     runMambaMultiStepTest(config, 8);
+}
+
+TEST(MambaSelectiveStateUpdate, Padding_MixedContextLengths)
+{
+    MambaTestConfig config{};
+    config.batch = 2;
+    config.nheads = 8;
+    config.dim = 64;
+    config.dstate = 64;
+    config.ngroups = 1;
+    config.useSiluGating = false;
+    config.useSkipConnection = true;
+    config.useDtBias = true;
+    config.dtSoftplus = true;
+    std::vector<int32_t> cl = {5, 16};
+    runMambaMultiStepTest(config, 16, &cl);
+}
+
+TEST(MambaSelectiveStateUpdate, Padding_AllShorter)
+{
+    MambaTestConfig config{};
+    config.batch = 2;
+    config.nheads = 8;
+    config.dim = 64;
+    config.dstate = 64;
+    config.ngroups = 1;
+    config.useSiluGating = false;
+    config.useSkipConnection = true;
+    config.useDtBias = true;
+    config.dtSoftplus = true;
+    std::vector<int32_t> cl = {3, 7};
+    runMambaMultiStepTest(config, 16, &cl);
 }

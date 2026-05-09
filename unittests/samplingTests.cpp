@@ -109,8 +109,7 @@ protected:
         }
 
         // Copy host data to device memory
-        CUDA_CHECK(cudaMemcpy(logitsTensor.rawPointer(), flatHostLogits.data(), batchSize * vocabSize * sizeof(float),
-            cudaMemcpyHostToDevice));
+        copyHostToDevice<float>(logitsTensor, flatHostLogits);
     }
 
     // Validate sampling results (FP32 only)
@@ -282,6 +281,18 @@ TEST_F(SamplingTest, TemperatureZeroParameterOverride)
     }
 }
 
+TEST_F(SamplingTest, ShouldUseNonGreedySampling)
+{
+    EXPECT_FALSE(trt_edgellm::shouldUseNonGreedySampling(1.0f, 0, 1.0f));
+    EXPECT_FALSE(trt_edgellm::shouldUseNonGreedySampling(0.0f, 0, 1.0f));
+    EXPECT_FALSE(trt_edgellm::shouldUseNonGreedySampling(0.7f, 1, 0.95f)); // topK=1 forces greedy
+    EXPECT_FALSE(trt_edgellm::shouldUseNonGreedySampling(1.2f, 1, 0.5f));  // topK=1 forces greedy
+    EXPECT_TRUE(trt_edgellm::shouldUseNonGreedySampling(0.7f, 0, 1.0f));
+    EXPECT_TRUE(trt_edgellm::shouldUseNonGreedySampling(1.2f, 0, 1.0f));
+    EXPECT_TRUE(trt_edgellm::shouldUseNonGreedySampling(1.0f, 2, 1.0f));
+    EXPECT_TRUE(trt_edgellm::shouldUseNonGreedySampling(1.0f, 0, 0.95f));
+}
+
 // Unified sampling tests (accuracy only)
 class SamplingTestSuites : public SamplingTest
 {
@@ -328,9 +339,7 @@ protected:
         CUDA_CHECK(cudaDeviceSynchronize());
 
         // Copy results back to host
-        std::vector<int32_t> gpuResults(batchSize);
-        CUDA_CHECK(cudaMemcpy(gpuResults.data(), selectedIndicesTensor.rawPointer(), batchSize * sizeof(int32_t),
-            cudaMemcpyDeviceToHost));
+        auto const gpuResults = copyDeviceToHost<int32_t>(selectedIndicesTensor);
 
         // Run validation and get result
         bool validationPassed = validateSamplingResults(gpuResults, hostLogits, params);
@@ -402,16 +411,12 @@ protected:
         CUDA_CHECK(cudaDeviceSynchronize());
 
         // Copy results back to host
-        std::vector<int32_t> gpuIndices(batchSize * topK);
-        CUDA_CHECK(cudaMemcpy(gpuIndices.data(), topKIndicesTensor.rawPointer(), batchSize * topK * sizeof(int32_t),
-            cudaMemcpyDeviceToHost));
+        auto const gpuIndices = copyDeviceToHost<int32_t>(topKIndicesTensor);
 
         std::vector<float> gpuValues;
         if (testValues)
         {
-            gpuValues.resize(batchSize * topK);
-            CUDA_CHECK(cudaMemcpy(gpuValues.data(), topKValuesTensor.rawPointer(), batchSize * topK * sizeof(float),
-                cudaMemcpyDeviceToHost));
+            gpuValues = copyDeviceToHost<float>(topKValuesTensor);
         }
 
         bool validationPassed

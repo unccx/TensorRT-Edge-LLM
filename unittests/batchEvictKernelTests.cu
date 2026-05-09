@@ -48,11 +48,12 @@ void flushL2Cache()
     CUDA_CHECK(cudaDeviceSynchronize());
 }
 
-// Initialize KV cache with distinct FP16 values for testing
-void initializeKVCache(std::vector<half>& kvCache, int32_t numLayers, int32_t maxBatchSize, int32_t numKVHeads,
+// Initialize a single KV cache layer with distinct FP16 values for testing
+// Layout: [maxBatchSize, 2, numKVHeads, maxSeqLen, headDim]
+void initializeKVCacheLayer(std::vector<half>& kvCache, int32_t layerIdx, int32_t maxBatchSize, int32_t numKVHeads,
     int32_t maxSeqLen, int32_t headDim, std::vector<int32_t> const& kvLengths)
 {
-    size_t totalSize = static_cast<size_t>(numLayers) * maxBatchSize * 2 * numKVHeads * maxSeqLen * headDim;
+    size_t totalSize = static_cast<size_t>(maxBatchSize) * 2 * numKVHeads * maxSeqLen * headDim;
     kvCache.resize(totalSize);
 
     // Use simple positive integers for valid positions
@@ -70,8 +71,8 @@ void initializeKVCache(std::vector<half>& kvCache, int32_t numLayers, int32_t ma
 
         if (s < seqLen)
         {
-            // Use simple positive integers: modulo 1000 to keep values small and cycle
-            int32_t value = static_cast<int32_t>(idx % 1000);
+            // Incorporate layerIdx into the value to make each layer distinct
+            int32_t value = static_cast<int32_t>((static_cast<size_t>(layerIdx) * totalSize + idx) % 1000);
             kvCache[idx] = __float2half(static_cast<float>(value));
         }
         else
@@ -82,84 +83,98 @@ void initializeKVCache(std::vector<half>& kvCache, int32_t numLayers, int32_t ma
     }
 }
 
-// Verify KV cache after compaction
-bool verifyKVCache(std::vector<half> const& kvCache, int32_t numLayers, int32_t maxBatchSize, int32_t numKVHeads,
+// Verify a single KV cache layer after compaction
+bool verifyKVCacheLayer(std::vector<half> const& kvCache, int32_t layerIdx, int32_t maxBatchSize, int32_t numKVHeads,
     int32_t maxSeqLen, int32_t headDim, std::vector<int32_t> const& batchMapping,
     std::vector<int32_t> const& oldKVLengths, std::vector<int32_t> const& newKVLengths)
 {
     size_t batchStride = static_cast<size_t>(2) * numKVHeads * maxSeqLen * headDim;
-    for (int32_t l = 0; l < numLayers; ++l)
-    {
-        for (int32_t oldIdx = 0; oldIdx < static_cast<int32_t>(batchMapping.size()); ++oldIdx)
-        {
-            int32_t newIdx = batchMapping[oldIdx];
-            if (newIdx < 0)
-            {
-                continue; // Evicted batch
-            }
+    size_t layerTotalSize = static_cast<size_t>(maxBatchSize) * batchStride;
 
-            int32_t seqLen = oldKVLengths[oldIdx];
-            if (seqLen == 0)
+    for (int32_t oldIdx = 0; oldIdx < static_cast<int32_t>(batchMapping.size()); ++oldIdx)
+    {
+        int32_t newIdx = batchMapping[oldIdx];
+        if (newIdx < 0)
+        {
+            continue; // Evicted batch
+        }
+
+        int32_t seqLen = oldKVLengths[oldIdx];
+        if (seqLen == 0)
+        {
+            continue;
+        }
+
+        // Verify KV cache lengths match
+        if (newKVLengths[newIdx] != seqLen)
+        {
+            std::cerr << "Length mismatch: newIdx=" << newIdx << " expected=" << seqLen
+                      << " got=" << newKVLengths[newIdx] << std::endl;
+            return false;
+        }
+
+        // Verify data using linear index - iterate through all positions in this batch
+        size_t oldBatchStart = static_cast<size_t>(oldIdx) * batchStride;
+        size_t newBatchStart = static_cast<size_t>(newIdx) * batchStride;
+        size_t seqStride = static_cast<size_t>(headDim);
+
+        for (size_t offset = 0; offset < batchStride; ++offset)
+        {
+            // Extract sequence position to check validity
+            size_t idxInBatch = offset;
+            int32_t s = static_cast<int32_t>((idxInBatch / seqStride) % maxSeqLen);
+
+            if (s >= seqLen)
             {
                 continue;
             }
 
-            // Verify KV cache lengths match
-            if (newKVLengths[newIdx] != seqLen)
+            size_t oldLinearIdx = oldBatchStart + offset;
+            size_t newLinearIdx = newBatchStart + offset;
+
+            // Expected value based on original linear index (incorporating layerIdx)
+            int32_t expectedIntValue
+                = static_cast<int32_t>((static_cast<size_t>(layerIdx) * layerTotalSize + oldLinearIdx) % 1000);
+            float expectedValue = static_cast<float>(expectedIntValue);
+            float actualValue = __half2float(kvCache[newLinearIdx]);
+
+            // For integer values in FP16 range, we expect exact match
+            if (actualValue != expectedValue)
             {
-                std::cerr << "Length mismatch: newIdx=" << newIdx << " expected=" << seqLen
-                          << " got=" << newKVLengths[newIdx] << std::endl;
+                // Extract detailed position for error reporting
+                int32_t kv = static_cast<int32_t>(offset / (numKVHeads * maxSeqLen * headDim));
+                int32_t h = static_cast<int32_t>((offset / (maxSeqLen * headDim)) % numKVHeads);
+                int32_t d = static_cast<int32_t>(offset % headDim);
+
+                std::cerr << "Data mismatch at layer=" << layerIdx << " newIdx=" << newIdx << " oldIdx=" << oldIdx
+                          << " kv=" << kv << " head=" << h << " seq=" << s << " dim=" << d
+                          << " expected=" << expectedValue << " got=" << actualValue
+                          << " (oldLinearIdx=" << oldLinearIdx << ")" << std::endl;
                 return false;
-            }
-
-            // Verify data using linear index - iterate through all positions in this batch
-            size_t oldBatchStart
-                = static_cast<size_t>(l) * maxBatchSize * batchStride + static_cast<size_t>(oldIdx) * batchStride;
-            size_t newBatchStart
-                = static_cast<size_t>(l) * maxBatchSize * batchStride + static_cast<size_t>(newIdx) * batchStride;
-            size_t seqStride = static_cast<size_t>(headDim);
-
-            for (size_t offset = 0; offset < batchStride; ++offset)
-            {
-                // Extract sequence position to check validity
-                size_t idxInBatch = offset;
-                int32_t s = static_cast<int32_t>((idxInBatch / seqStride) % maxSeqLen);
-
-                if (s >= seqLen)
-                {
-                    continue;
-                }
-
-                size_t oldLinearIdx = oldBatchStart + offset;
-                size_t newLinearIdx = newBatchStart + offset;
-
-                // Expected value based on original linear index
-                int32_t expectedIntValue = static_cast<int32_t>(oldLinearIdx % 1000);
-                float expectedValue = static_cast<float>(expectedIntValue);
-                float actualValue = __half2float(kvCache[newLinearIdx]);
-
-                // For integer values in FP16 range, we expect exact match
-                if (actualValue != expectedValue)
-                {
-                    // Extract detailed position for error reporting
-                    int32_t kv = static_cast<int32_t>(offset / (numKVHeads * maxSeqLen * headDim));
-                    int32_t h = static_cast<int32_t>((offset / (maxSeqLen * headDim)) % numKVHeads);
-                    int32_t d = static_cast<int32_t>(offset % headDim);
-
-                    std::cerr << "Data mismatch at layer=" << l << " newIdx=" << newIdx << " oldIdx=" << oldIdx
-                              << " kv=" << kv << " head=" << h << " seq=" << s << " dim=" << d
-                              << " expected=" << expectedValue << " got=" << actualValue
-                              << " (oldLinearIdx=" << oldLinearIdx << ")" << std::endl;
-                    return false;
-                }
             }
         }
     }
     return true;
 }
 
+// Helper to compact KV cache across multiple layers using the single-layer API
+void compactKVCacheAllLayers(std::vector<rt::Tensor>& kvCacheLayers, rt::Tensor const& batchMapping,
+    rt::Tensor& kvCacheLengths, rt::Tensor& dstKVCacheLengths, int32_t oldActiveBatch, int32_t newActiveBatch,
+    cudaStream_t stream)
+{
+    // Compact KV data per-layer without updating lengths (in-place length update would
+    // corrupt source lengths that subsequent layers still read).
+    for (int32_t l = 0; l < static_cast<int32_t>(kvCacheLayers.size()); ++l)
+    {
+        compactKVCacheSingleLayer(kvCacheLayers[l], batchMapping, kvCacheLengths, dstKVCacheLengths, oldActiveBatch,
+            newActiveBatch, /*updateLengths=*/false, stream);
+    }
+    // Compact lengths separately after all layers are done.
+    compactTensorBatch(kvCacheLengths, batchMapping, dstKVCacheLengths, oldActiveBatch, newActiveBatch, stream);
+}
+
 // ============================================================================
-// Test 1: compactKVCache - Basic Functionality
+// Test 1: compactKVCacheSingleLayer - Basic Functionality
 // ============================================================================
 TEST(BatchEvictKernels, CompactKVCacheBasicEviction)
 {
@@ -178,42 +193,43 @@ TEST(BatchEvictKernels, CompactKVCacheBasicEviction)
     std::vector<int32_t> batchMapping = {0, -1, 1, 2};
     std::vector<int32_t> oldKVLengths = {64, 32, 48, 80};
 
-    // Initialize KV cache
-    std::vector<half> kvCacheHost;
-    initializeKVCache(kvCacheHost, numLayers, maxBatchSize, numKVHeads, maxSeqLen, headDim, oldKVLengths);
+    // Initialize per-layer KV caches
+    std::vector<std::vector<half>> kvCacheHostLayers(numLayers);
+    std::vector<rt::Tensor> kvCacheDeviceLayers;
+    kvCacheDeviceLayers.reserve(numLayers);
 
-    // Create GPU tensors
-    rt::Tensor kvCacheDevice(
-        {numLayers, maxBatchSize, 2, numKVHeads, maxSeqLen, headDim}, rt::DeviceType::kGPU, DataType::kHALF);
+    for (int32_t l = 0; l < numLayers; ++l)
+    {
+        initializeKVCacheLayer(kvCacheHostLayers[l], l, maxBatchSize, numKVHeads, maxSeqLen, headDim, oldKVLengths);
+        kvCacheDeviceLayers.emplace_back(
+            rt::Tensor({maxBatchSize, 2, numKVHeads, maxSeqLen, headDim}, rt::DeviceType::kGPU, DataType::kHALF));
+        copyHostToDevice(kvCacheDeviceLayers[l], kvCacheHostLayers[l]);
+    }
+
+    // Create GPU tensors for lengths and mapping
     rt::Tensor kvLengthsDevice({maxBatchSize}, rt::DeviceType::kGPU, DataType::kINT32);
     rt::Tensor batchMappingDevice({oldActiveBatch}, rt::DeviceType::kGPU, DataType::kINT32);
 
-    // Copy to GPU
-    CUDA_CHECK(cudaMemcpy(
-        kvCacheDevice.rawPointer(), kvCacheHost.data(), kvCacheHost.size() * sizeof(half), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(kvLengthsDevice.rawPointer(), oldKVLengths.data(), oldKVLengths.size() * sizeof(int32_t),
-        cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(batchMappingDevice.rawPointer(), batchMapping.data(), batchMapping.size() * sizeof(int32_t),
-        cudaMemcpyHostToDevice));
+    copyHostToDevice(kvLengthsDevice, oldKVLengths);
+    copyHostToDevice(batchMappingDevice, batchMapping);
 
-    // Execute kernel
-    compactKVCache(batchMappingDevice, kvCacheDevice, kvLengthsDevice, oldActiveBatch, newActiveBatch, stream);
+    // Execute kernel across all layers
+    compactKVCacheAllLayers(kvCacheDeviceLayers, batchMappingDevice, kvLengthsDevice, kvLengthsDevice, oldActiveBatch,
+        newActiveBatch, stream);
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
-    // Copy back results
-    CUDA_CHECK(cudaMemcpy(
-        kvCacheHost.data(), kvCacheDevice.rawPointer(), kvCacheHost.size() * sizeof(half), cudaMemcpyDeviceToHost));
-    std::vector<int32_t> newKVLengths(maxBatchSize);
-    CUDA_CHECK(cudaMemcpy(
-        newKVLengths.data(), kvLengthsDevice.rawPointer(), maxBatchSize * sizeof(int32_t), cudaMemcpyDeviceToHost));
-
-    // Verify results
-    EXPECT_TRUE(verifyKVCache(kvCacheHost, numLayers, maxBatchSize, numKVHeads, maxSeqLen, headDim, batchMapping,
-        oldKVLengths, newKVLengths));
+    // Copy back results and verify
+    auto const newKVLengths = copyDeviceToHost<int32_t>(kvLengthsDevice);
+    for (int32_t l = 0; l < numLayers; ++l)
+    {
+        auto const kvCacheHost = copyDeviceToHost<half>(kvCacheDeviceLayers[l]);
+        EXPECT_TRUE(verifyKVCacheLayer(
+            kvCacheHost, l, maxBatchSize, numKVHeads, maxSeqLen, headDim, batchMapping, oldKVLengths, newKVLengths));
+    }
 }
 
 // ============================================================================
-// Test 2: compactKVCache - Multiple Evictions
+// Test 2: compactKVCacheSingleLayer - Multiple Evictions
 // ============================================================================
 TEST(BatchEvictKernels, CompactKVCacheMultipleEvictions)
 {
@@ -231,39 +247,42 @@ TEST(BatchEvictKernels, CompactKVCacheMultipleEvictions)
     std::vector<int32_t> batchMapping = {0, -1, 1, -1, 2, -1, 3, 4};
     std::vector<int32_t> oldKVLengths = {64, 32, 48, 80, 96, 72, 120, 88};
 
-    // Initialize and allocate
-    std::vector<half> kvCacheHost;
-    initializeKVCache(kvCacheHost, numLayers, maxBatchSize, numKVHeads, maxSeqLen, headDim, oldKVLengths);
+    // Initialize per-layer KV caches
+    std::vector<std::vector<half>> kvCacheHostLayers(numLayers);
+    std::vector<rt::Tensor> kvCacheDeviceLayers;
+    kvCacheDeviceLayers.reserve(numLayers);
 
-    rt::Tensor kvCacheDevice(
-        {numLayers, maxBatchSize, 2, numKVHeads, maxSeqLen, headDim}, rt::DeviceType::kGPU, DataType::kHALF);
+    for (int32_t l = 0; l < numLayers; ++l)
+    {
+        initializeKVCacheLayer(kvCacheHostLayers[l], l, maxBatchSize, numKVHeads, maxSeqLen, headDim, oldKVLengths);
+        kvCacheDeviceLayers.emplace_back(
+            rt::Tensor({maxBatchSize, 2, numKVHeads, maxSeqLen, headDim}, rt::DeviceType::kGPU, DataType::kHALF));
+        copyHostToDevice(kvCacheDeviceLayers[l], kvCacheHostLayers[l]);
+    }
+
     rt::Tensor kvLengthsDevice({maxBatchSize}, rt::DeviceType::kGPU, DataType::kINT32);
     rt::Tensor batchMappingDevice({oldActiveBatch}, rt::DeviceType::kGPU, DataType::kINT32);
 
-    CUDA_CHECK(cudaMemcpy(
-        kvCacheDevice.rawPointer(), kvCacheHost.data(), kvCacheHost.size() * sizeof(half), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(kvLengthsDevice.rawPointer(), oldKVLengths.data(), oldKVLengths.size() * sizeof(int32_t),
-        cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(batchMappingDevice.rawPointer(), batchMapping.data(), batchMapping.size() * sizeof(int32_t),
-        cudaMemcpyHostToDevice));
+    copyHostToDevice(kvLengthsDevice, oldKVLengths);
+    copyHostToDevice(batchMappingDevice, batchMapping);
 
     // Execute
-    compactKVCache(batchMappingDevice, kvCacheDevice, kvLengthsDevice, oldActiveBatch, newActiveBatch, stream);
+    compactKVCacheAllLayers(kvCacheDeviceLayers, batchMappingDevice, kvLengthsDevice, kvLengthsDevice, oldActiveBatch,
+        newActiveBatch, stream);
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
     // Verify
-    CUDA_CHECK(cudaMemcpy(
-        kvCacheHost.data(), kvCacheDevice.rawPointer(), kvCacheHost.size() * sizeof(half), cudaMemcpyDeviceToHost));
-    std::vector<int32_t> newKVLengths(maxBatchSize);
-    CUDA_CHECK(cudaMemcpy(
-        newKVLengths.data(), kvLengthsDevice.rawPointer(), maxBatchSize * sizeof(int32_t), cudaMemcpyDeviceToHost));
-
-    EXPECT_TRUE(verifyKVCache(kvCacheHost, numLayers, maxBatchSize, numKVHeads, maxSeqLen, headDim, batchMapping,
-        oldKVLengths, newKVLengths));
+    auto const newKVLengths = copyDeviceToHost<int32_t>(kvLengthsDevice);
+    for (int32_t l = 0; l < numLayers; ++l)
+    {
+        auto const kvCacheHost = copyDeviceToHost<half>(kvCacheDeviceLayers[l]);
+        EXPECT_TRUE(verifyKVCacheLayer(
+            kvCacheHost, l, maxBatchSize, numKVHeads, maxSeqLen, headDim, batchMapping, oldKVLengths, newKVLengths));
+    }
 }
 
 // ============================================================================
-// Test 3: compactKVCache
+// Test 3: compactKVCacheSingleLayer - Edge Cases
 // ============================================================================
 TEST(BatchEvictKernels, CompactKVCacheSmallTestCases)
 {
@@ -280,27 +299,24 @@ TEST(BatchEvictKernels, CompactKVCacheSmallTestCases)
         std::vector<int32_t> oldKVLengths = {32, 48, 24, 56};
 
         std::vector<half> kvCacheHost;
-        initializeKVCache(kvCacheHost, numLayers, maxBatchSize, numKVHeads, maxSeqLen, headDim, oldKVLengths);
+        initializeKVCacheLayer(kvCacheHost, 0, maxBatchSize, numKVHeads, maxSeqLen, headDim, oldKVLengths);
         std::vector<half> kvCacheOriginal = kvCacheHost; // Backup
 
         rt::Tensor kvCacheDevice(
-            {numLayers, maxBatchSize, 2, numKVHeads, maxSeqLen, headDim}, rt::DeviceType::kGPU, DataType::kHALF);
+            {maxBatchSize, 2, numKVHeads, maxSeqLen, headDim}, rt::DeviceType::kGPU, DataType::kHALF);
         rt::Tensor kvLengthsDevice({maxBatchSize}, rt::DeviceType::kGPU, DataType::kINT32);
         rt::Tensor batchMappingDevice({4}, rt::DeviceType::kGPU, DataType::kINT32);
 
-        CUDA_CHECK(cudaMemcpy(
-            kvCacheDevice.rawPointer(), kvCacheHost.data(), kvCacheHost.size() * sizeof(half), cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(kvLengthsDevice.rawPointer(), oldKVLengths.data(), oldKVLengths.size() * sizeof(int32_t),
-            cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(batchMappingDevice.rawPointer(), batchMapping.data(),
-            batchMapping.size() * sizeof(int32_t), cudaMemcpyHostToDevice));
+        copyHostToDevice(kvCacheDevice, kvCacheHost);
+        copyHostToDevice(kvLengthsDevice, oldKVLengths);
+        copyHostToDevice(batchMappingDevice, batchMapping);
 
-        compactKVCache(batchMappingDevice, kvCacheDevice, kvLengthsDevice, 4, 4, stream);
+        compactKVCacheSingleLayer(
+            kvCacheDevice, batchMappingDevice, kvLengthsDevice, kvLengthsDevice, 4, 4, true, stream);
         CUDA_CHECK(cudaStreamSynchronize(stream));
 
         // Verify data unchanged
-        CUDA_CHECK(cudaMemcpy(
-            kvCacheHost.data(), kvCacheDevice.rawPointer(), kvCacheHost.size() * sizeof(half), cudaMemcpyDeviceToHost));
+        kvCacheHost = copyDeviceToHost<half>(kvCacheDevice);
 
         // Data should be identical
         for (size_t i = 0; i < kvCacheHost.size(); ++i)
@@ -315,31 +331,26 @@ TEST(BatchEvictKernels, CompactKVCacheSmallTestCases)
         std::vector<int32_t> oldKVLengths = {32, 48, 24, 56};
 
         std::vector<half> kvCacheHost;
-        initializeKVCache(kvCacheHost, numLayers, maxBatchSize, numKVHeads, maxSeqLen, headDim, oldKVLengths);
+        initializeKVCacheLayer(kvCacheHost, 0, maxBatchSize, numKVHeads, maxSeqLen, headDim, oldKVLengths);
 
         rt::Tensor kvCacheDevice(
-            {numLayers, maxBatchSize, 2, numKVHeads, maxSeqLen, headDim}, rt::DeviceType::kGPU, DataType::kHALF);
+            {maxBatchSize, 2, numKVHeads, maxSeqLen, headDim}, rt::DeviceType::kGPU, DataType::kHALF);
         rt::Tensor kvLengthsDevice({maxBatchSize}, rt::DeviceType::kGPU, DataType::kINT32);
         rt::Tensor batchMappingDevice({4}, rt::DeviceType::kGPU, DataType::kINT32);
 
-        CUDA_CHECK(cudaMemcpy(
-            kvCacheDevice.rawPointer(), kvCacheHost.data(), kvCacheHost.size() * sizeof(half), cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(kvLengthsDevice.rawPointer(), oldKVLengths.data(), oldKVLengths.size() * sizeof(int32_t),
-            cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(batchMappingDevice.rawPointer(), batchMapping.data(),
-            batchMapping.size() * sizeof(int32_t), cudaMemcpyHostToDevice));
+        copyHostToDevice(kvCacheDevice, kvCacheHost);
+        copyHostToDevice(kvLengthsDevice, oldKVLengths);
+        copyHostToDevice(batchMappingDevice, batchMapping);
 
-        compactKVCache(batchMappingDevice, kvCacheDevice, kvLengthsDevice, 4, 1, stream);
+        compactKVCacheSingleLayer(
+            kvCacheDevice, batchMappingDevice, kvLengthsDevice, kvLengthsDevice, 4, 1, true, stream);
         CUDA_CHECK(cudaStreamSynchronize(stream));
 
-        CUDA_CHECK(cudaMemcpy(
-            kvCacheHost.data(), kvCacheDevice.rawPointer(), kvCacheHost.size() * sizeof(half), cudaMemcpyDeviceToHost));
-        std::vector<int32_t> newKVLengths(maxBatchSize);
-        CUDA_CHECK(cudaMemcpy(
-            newKVLengths.data(), kvLengthsDevice.rawPointer(), maxBatchSize * sizeof(int32_t), cudaMemcpyDeviceToHost));
+        kvCacheHost = copyDeviceToHost<half>(kvCacheDevice);
+        auto const newKVLengths = copyDeviceToHost<int32_t>(kvLengthsDevice);
 
-        EXPECT_TRUE(verifyKVCache(kvCacheHost, numLayers, maxBatchSize, numKVHeads, maxSeqLen, headDim, batchMapping,
-            oldKVLengths, newKVLengths));
+        EXPECT_TRUE(verifyKVCacheLayer(
+            kvCacheHost, 0, maxBatchSize, numKVHeads, maxSeqLen, headDim, batchMapping, oldKVLengths, newKVLengths));
     }
 }
 
@@ -360,8 +371,7 @@ TEST(BatchEvictKernels, CompactTensorBatchInPlace)
 
     // Prepare shared batchMapping on GPU (used by all sub-tests)
     rt::Tensor batchMappingDevice({oldActiveBatch}, rt::DeviceType::kGPU, DataType::kINT32);
-    CUDA_CHECK(cudaMemcpy(batchMappingDevice.rawPointer(), batchMapping.data(), batchMapping.size() * sizeof(int32_t),
-        cudaMemcpyHostToDevice));
+    copyHostToDevice(batchMappingDevice, batchMapping);
 
     // Test 1: half type (common for hidden states, logits)
     {
@@ -377,16 +387,13 @@ TEST(BatchEvictKernels, CompactTensorBatchInPlace)
 
         rt::Tensor tensorDevice({oldActiveBatch, dim1, dim2}, rt::DeviceType::kGPU, DataType::kHALF);
 
-        CUDA_CHECK(cudaMemcpy(
-            tensorDevice.rawPointer(), srcData.data(), srcData.size() * sizeof(half), cudaMemcpyHostToDevice));
+        copyHostToDevice(tensorDevice, srcData);
 
         // In-place compaction
         compactTensorBatch(tensorDevice, batchMappingDevice, tensorDevice, oldActiveBatch, newActiveBatch, stream);
         CUDA_CHECK(cudaStreamSynchronize(stream));
 
-        std::vector<half> resultData(oldActiveBatch * dim1 * dim2);
-        CUDA_CHECK(cudaMemcpy(
-            resultData.data(), tensorDevice.rawPointer(), resultData.size() * sizeof(half), cudaMemcpyDeviceToHost));
+        auto const resultData = copyDeviceToHost<half>(tensorDevice);
 
         // Verify
         for (int32_t oldIdx = 0; oldIdx < oldActiveBatch; ++oldIdx)
@@ -420,15 +427,12 @@ TEST(BatchEvictKernels, CompactTensorBatchInPlace)
 
         rt::Tensor tensorDevice({oldActiveBatch, dim1, dim2}, rt::DeviceType::kGPU, DataType::kFLOAT);
 
-        CUDA_CHECK(cudaMemcpy(
-            tensorDevice.rawPointer(), srcData.data(), srcData.size() * sizeof(float), cudaMemcpyHostToDevice));
+        copyHostToDevice(tensorDevice, srcData);
 
         compactTensorBatch(tensorDevice, batchMappingDevice, tensorDevice, oldActiveBatch, newActiveBatch, stream);
         CUDA_CHECK(cudaStreamSynchronize(stream));
 
-        std::vector<float> resultData(oldActiveBatch * dim1 * dim2);
-        CUDA_CHECK(cudaMemcpy(
-            resultData.data(), tensorDevice.rawPointer(), resultData.size() * sizeof(float), cudaMemcpyDeviceToHost));
+        auto const resultData = copyDeviceToHost<float>(tensorDevice);
 
         for (int32_t oldIdx = 0; oldIdx < oldActiveBatch; ++oldIdx)
         {
@@ -460,15 +464,12 @@ TEST(BatchEvictKernels, CompactTensorBatchInPlace)
 
         rt::Tensor tensorDevice({oldActiveBatch, dim1_int}, rt::DeviceType::kGPU, DataType::kINT32);
 
-        CUDA_CHECK(cudaMemcpy(
-            tensorDevice.rawPointer(), srcData.data(), srcData.size() * sizeof(int32_t), cudaMemcpyHostToDevice));
+        copyHostToDevice(tensorDevice, srcData);
 
         compactTensorBatch(tensorDevice, batchMappingDevice, tensorDevice, oldActiveBatch, newActiveBatch, stream);
         CUDA_CHECK(cudaStreamSynchronize(stream));
 
-        std::vector<int32_t> resultData(oldActiveBatch * dim1_int);
-        CUDA_CHECK(cudaMemcpy(
-            resultData.data(), tensorDevice.rawPointer(), resultData.size() * sizeof(int32_t), cudaMemcpyDeviceToHost));
+        auto const resultData = copyDeviceToHost<int32_t>(tensorDevice);
 
         for (int32_t oldIdx = 0; oldIdx < oldActiveBatch; ++oldIdx)
         {
@@ -487,7 +488,7 @@ TEST(BatchEvictKernels, CompactTensorBatchInPlace)
 }
 
 // ============================================================================
-// Performance Test: compactKVCache
+// Performance Test: compactKVCacheSingleLayer
 // ============================================================================
 TEST(BatchEvictKernels, DISABLED_CompactKVCachePerformance)
 {
@@ -505,26 +506,30 @@ TEST(BatchEvictKernels, DISABLED_CompactKVCachePerformance)
     std::vector<int32_t> batchMapping = {0, -1, 1, 2, 3, -1, 4, 5};
     std::vector<int32_t> oldKVLengths = {512, 256, 768, 1024, 384, 640, 896, 448};
 
-    // Initialize data
-    std::vector<half> kvCacheHost;
-    initializeKVCache(kvCacheHost, numLayers, maxBatchSize, numKVHeads, maxSeqLen, headDim, oldKVLengths);
+    // Initialize per-layer data
+    std::vector<std::vector<half>> kvCacheHostLayers(numLayers);
+    std::vector<rt::Tensor> kvCacheDeviceLayers;
+    kvCacheDeviceLayers.reserve(numLayers);
 
-    rt::Tensor kvCacheDevice(
-        {numLayers, maxBatchSize, 2, numKVHeads, maxSeqLen, headDim}, rt::DeviceType::kGPU, DataType::kHALF);
+    for (int32_t l = 0; l < numLayers; ++l)
+    {
+        initializeKVCacheLayer(kvCacheHostLayers[l], l, maxBatchSize, numKVHeads, maxSeqLen, headDim, oldKVLengths);
+        kvCacheDeviceLayers.emplace_back(
+            rt::Tensor({maxBatchSize, 2, numKVHeads, maxSeqLen, headDim}, rt::DeviceType::kGPU, DataType::kHALF));
+        copyHostToDevice(kvCacheDeviceLayers[l], kvCacheHostLayers[l]);
+    }
+
     rt::Tensor kvLengthsDevice({maxBatchSize}, rt::DeviceType::kGPU, DataType::kINT32);
     rt::Tensor batchMappingDevice({oldActiveBatch}, rt::DeviceType::kGPU, DataType::kINT32);
 
-    CUDA_CHECK(cudaMemcpy(
-        kvCacheDevice.rawPointer(), kvCacheHost.data(), kvCacheHost.size() * sizeof(half), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(kvLengthsDevice.rawPointer(), oldKVLengths.data(), oldKVLengths.size() * sizeof(int32_t),
-        cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(batchMappingDevice.rawPointer(), batchMapping.data(), batchMapping.size() * sizeof(int32_t),
-        cudaMemcpyHostToDevice));
+    copyHostToDevice(kvLengthsDevice, oldKVLengths);
+    copyHostToDevice(batchMappingDevice, batchMapping);
 
     // Warmup
     for (int i = 0; i < 5; ++i)
     {
-        compactKVCache(batchMappingDevice, kvCacheDevice, kvLengthsDevice, oldActiveBatch, newActiveBatch, stream);
+        compactKVCacheAllLayers(kvCacheDeviceLayers, batchMappingDevice, kvLengthsDevice, kvLengthsDevice,
+            oldActiveBatch, newActiveBatch, stream);
     }
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
@@ -539,10 +544,11 @@ TEST(BatchEvictKernels, DISABLED_CompactKVCachePerformance)
         flushL2Cache();
 
         // Reset data
-        CUDA_CHECK(cudaMemcpy(
-            kvCacheDevice.rawPointer(), kvCacheHost.data(), kvCacheHost.size() * sizeof(half), cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(kvLengthsDevice.rawPointer(), oldKVLengths.data(), oldKVLengths.size() * sizeof(int32_t),
-            cudaMemcpyHostToDevice));
+        for (int32_t l = 0; l < numLayers; ++l)
+        {
+            copyHostToDevice(kvCacheDeviceLayers[l], kvCacheHostLayers[l]);
+        }
+        copyHostToDevice(kvLengthsDevice, oldKVLengths);
 
         // Time the kernel
         cudaEvent_t start, stop;
@@ -550,7 +556,8 @@ TEST(BatchEvictKernels, DISABLED_CompactKVCachePerformance)
         CUDA_CHECK(cudaEventCreate(&stop));
 
         CUDA_CHECK(cudaEventRecord(start, stream));
-        compactKVCache(batchMappingDevice, kvCacheDevice, kvLengthsDevice, oldActiveBatch, newActiveBatch, stream);
+        compactKVCacheAllLayers(kvCacheDeviceLayers, batchMappingDevice, kvLengthsDevice, kvLengthsDevice,
+            oldActiveBatch, newActiveBatch, stream);
         CUDA_CHECK(cudaEventRecord(stop, stream));
         CUDA_CHECK(cudaEventSynchronize(stop));
 
@@ -591,7 +598,7 @@ TEST(BatchEvictKernels, DISABLED_CompactKVCachePerformance)
     size_t totalBytes = totalElements * sizeof(half);
     float avgBandwidthGB = (totalBytes / (1024.0f * 1024.0f * 1024.0f)) / (avgTime / 1000.0f);
 
-    std::cout << "\n=== compactKVCache Performance (Cold Cache) ===" << std::endl;
+    std::cout << "\n=== compactKVCacheSingleLayer Performance (Cold Cache) ===" << std::endl;
     std::cout << "Configuration: " << numLayers << " layers, " << maxBatchSize << " max batch, " << numKVHeads
               << " heads, " << maxSeqLen << " max seq, " << headDim << " dim" << std::endl;
     std::cout << "Eviction: " << oldActiveBatch << " -> " << newActiveBatch << " batches" << std::endl;
@@ -624,14 +631,12 @@ TEST(BatchEvictKernels, DISABLED_CompactTensorBatchPerformance)
     rt::Tensor tensorDevice({oldActiveBatch, dim1, dim2}, rt::DeviceType::kGPU, DataType::kHALF);
     rt::Tensor batchMappingDevice({oldActiveBatch}, rt::DeviceType::kGPU, DataType::kINT32);
 
-    CUDA_CHECK(cudaMemcpy(batchMappingDevice.rawPointer(), batchMapping.data(), batchMapping.size() * sizeof(int32_t),
-        cudaMemcpyHostToDevice));
+    copyHostToDevice(batchMappingDevice, batchMapping);
 
     // Warmup
     for (int i = 0; i < 5; ++i)
     {
-        CUDA_CHECK(cudaMemcpy(
-            tensorDevice.rawPointer(), srcData.data(), srcData.size() * sizeof(half), cudaMemcpyHostToDevice));
+        copyHostToDevice(tensorDevice, srcData);
         compactTensorBatch(tensorDevice, batchMappingDevice, tensorDevice, oldActiveBatch, newActiveBatch, stream);
     }
     CUDA_CHECK(cudaStreamSynchronize(stream));
@@ -647,8 +652,7 @@ TEST(BatchEvictKernels, DISABLED_CompactTensorBatchPerformance)
         flushL2Cache();
 
         // Reset source data
-        CUDA_CHECK(cudaMemcpy(
-            tensorDevice.rawPointer(), srcData.data(), srcData.size() * sizeof(half), cudaMemcpyHostToDevice));
+        copyHostToDevice(tensorDevice, srcData);
 
         cudaEvent_t start, stop;
         CUDA_CHECK(cudaEventCreate(&start));

@@ -17,13 +17,15 @@
 
 #include "common/checkMacros.h"
 #include "common/tensor.h"
+#ifdef CUTE_DSL_GEMM_ENABLED
+#include "kernels/talkerMLPKernels/cuteDslGemmRunner.h"
+#endif
 #include "kernels/talkerMLPKernels/talkerMLPKernels.h"
 #include "testUtils.h"
 
 #include <cmath>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
-#include <dlfcn.h>
 #include <gtest/gtest.h>
 #include <tuple>
 #include <vector>
@@ -77,48 +79,32 @@ void referenceTalkerMLP(std::vector<half> const& input, std::vector<half> const&
 } // namespace
 
 // ============================================================================
-// Fixture for tests that require cuBLAS (invokeTalkerMLP)
+// Fixture for tests that require CuTe DSL GEMM (invokeTalkerMLP / invokeLinearLayer)
 // ============================================================================
 class TalkerMLPTest : public ::testing::Test
 {
 protected:
     cudaStream_t stream{};
-    void* cublasLib{nullptr};
-    void* cublasHandle{nullptr};
 
     void SetUp() override
     {
         cudaSetDevice(0);
         CUDA_CHECK(cudaStreamCreate(&stream));
-
-        cublasLib = dlopen("libcublas.so", RTLD_LAZY);
-        if (!cublasLib)
+#ifndef CUTE_DSL_GEMM_ENABLED
+        GTEST_SKIP() << "CuTe DSL GEMM not enabled in this build";
+#else
+        if (!trt_edgellm::CuteDslGemmRunner::loadKernelModule())
         {
-            GTEST_SKIP() << "cuBLAS not available";
+            GTEST_SKIP() << "Failed to load CuTe DSL GEMM kernel module";
         }
-        auto createFn = reinterpret_cast<int (*)(void**)>(dlsym(cublasLib, "cublasCreate_v2"));
-        if (!createFn || createFn(&cublasHandle) != 0)
-        {
-            dlclose(cublasLib);
-            cublasLib = nullptr;
-            GTEST_SKIP() << "Failed to create cuBLAS handle";
-        }
+#endif
     }
 
     void TearDown() override
     {
-        if (cublasHandle && cublasLib)
-        {
-            auto destroyFn = reinterpret_cast<int (*)(void*)>(dlsym(cublasLib, "cublasDestroy_v2"));
-            if (destroyFn)
-            {
-                destroyFn(cublasHandle);
-            }
-        }
-        if (cublasLib)
-        {
-            dlclose(cublasLib);
-        }
+#ifdef CUTE_DSL_GEMM_ENABLED
+        trt_edgellm::CuteDslGemmRunner::unloadKernelModule();
+#endif
         CUDA_CHECK(cudaStreamSynchronize(stream));
         CUDA_CHECK(cudaStreamDestroy(stream));
     }
@@ -196,23 +182,15 @@ TEST_F(TalkerMLPTest, MLPAccuracy)
         rt::Tensor gpuOutput(outputShape, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
         rt::Tensor gpuWorkspace(workspaceShape, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
 
-        CUDA_CHECK(cudaMemcpy(
-            gpuInput.rawPointer(), hostInput.data(), hostInput.size() * sizeof(half), cudaMemcpyHostToDevice));
-        CUDA_CHECK(
-            cudaMemcpy(gpuFc1W.rawPointer(), hostFc1W.data(), hostFc1W.size() * sizeof(half), cudaMemcpyHostToDevice));
-        CUDA_CHECK(
-            cudaMemcpy(gpuFc1B.rawPointer(), hostFc1B.data(), hostFc1B.size() * sizeof(half), cudaMemcpyHostToDevice));
-        CUDA_CHECK(
-            cudaMemcpy(gpuFc2W.rawPointer(), hostFc2W.data(), hostFc2W.size() * sizeof(half), cudaMemcpyHostToDevice));
-        CUDA_CHECK(
-            cudaMemcpy(gpuFc2B.rawPointer(), hostFc2B.data(), hostFc2B.size() * sizeof(half), cudaMemcpyHostToDevice));
+        copyHostToDevice(gpuInput, hostInput);
+        copyHostToDevice(gpuFc1W, hostFc1W);
+        copyHostToDevice(gpuFc1B, hostFc1B);
+        copyHostToDevice(gpuFc2W, hostFc2W);
+        copyHostToDevice(gpuFc2B, hostFc2B);
 
-        kernel::invokeTalkerMLP(
-            cublasHandle, gpuInput, gpuFc1W, gpuFc1B, gpuFc2W, gpuFc2B, gpuOutput, gpuWorkspace, stream);
+        kernel::invokeTalkerMLP(gpuInput, gpuFc1W, gpuFc1B, gpuFc2W, gpuFc2B, gpuOutput, gpuWorkspace, stream);
 
-        std::vector<half> gpuResult(numTokens * outputDim);
-        CUDA_CHECK(cudaMemcpy(
-            gpuResult.data(), gpuOutput.rawPointer(), gpuResult.size() * sizeof(half), cudaMemcpyDeviceToHost));
+        auto const gpuResult = copyDeviceToHost<half>(gpuOutput);
         CUDA_CHECK(cudaStreamSynchronize(stream));
 
         // For large-dim GEMM, allow a small fraction of outliers due to FP16 accumulation differences
@@ -252,18 +230,14 @@ TEST_F(TalkerKernelTest, GatherScatterRoundTrip)
     rt::Tensor gpuGatherOut(gatherShape, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
     rt::Tensor gpuScatterOut(scatterShape, rt::DeviceType::kGPU, nvinfer1::DataType::kHALF);
 
-    CUDA_CHECK(cudaMemcpy(
-        gpuSource.rawPointer(), hostSource.data(), hostSource.size() * sizeof(half), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(
-        gpuIndices.rawPointer(), hostIndices.data(), hostIndices.size() * sizeof(int32_t), cudaMemcpyHostToDevice));
+    copyHostToDevice(gpuSource, hostSource);
+    copyHostToDevice(gpuIndices, hostIndices);
     CUDA_CHECK(cudaMemset(gpuScatterOut.rawPointer(), 0, srcTokens * hiddenDim * sizeof(half)));
 
     kernel::invokeGather(gpuSource, gpuIndices, gpuGatherOut, stream);
     kernel::invokeScatter(gpuGatherOut, gpuIndices, gpuScatterOut, stream);
 
-    std::vector<half> scatterResult(srcTokens * hiddenDim);
-    CUDA_CHECK(cudaMemcpy(
-        scatterResult.data(), gpuScatterOut.rawPointer(), scatterResult.size() * sizeof(half), cudaMemcpyDeviceToHost));
+    auto const scatterResult = copyDeviceToHost<half>(gpuScatterOut);
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
     for (int32_t idx = 0; idx < numIndices; ++idx)
@@ -303,10 +277,8 @@ static std::vector<float> runTalkerLogitAdjust(std::vector<float> const& hostLog
     kernel::invokeTalkerLogitAdjust(gpuSeen, gpuLogits, suppressStart, suppressEnd, codecEosId,
         static_cast<int32_t>(hostSeenTokens.size()), repetitionPenalty, stream);
 
-    std::vector<float> result(vocabSize);
-    CUDA_CHECK(cudaMemcpy(result.data(), gpuLogits.rawPointer(), vocabSize * sizeof(float), cudaMemcpyDeviceToHost));
     CUDA_CHECK(cudaStreamSynchronize(stream));
-    return result;
+    return copyDeviceToHost<float>(gpuLogits);
 }
 
 // Suppression range [suppressStart, suppressEnd) is set to -inf, except codecEosId.

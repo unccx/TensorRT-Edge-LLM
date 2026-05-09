@@ -59,11 +59,13 @@ def test_build_project(env_config: EnvironmentConfig,
         cmake_cmd.append(
             '-DCMAKE_TOOLCHAIN_FILE=cmake/aarch64_linux_toolchain.cmake')
 
-    # Enable CuTe DSL FMHA for Blackwell+ (SM >= 100) targets, except auto-thor
-    if (device_config.compute_capability is not None
-            and device_config.compute_capability in (100, 101, 110)
-            and device_config.target != 'auto-thor'):
-        cmake_cmd.append('-DENABLE_CUTE_DSL_FMHA=ON')
+    # Enable CuteDSL kernels for Blackwell aarch64 targets.
+    if device_config.target in ['auto-thor', 'jetson-thor', 'gb10']:
+        # Prebuilt tarballs are committed in kernelSrcs/cuteDSLPrebuilt/.
+        # CMake auto-extracts them — no on-device build needed.
+        cmake_cmd.append('-DENABLE_CUTE_DSL=ALL')
+        test_logger.info(
+            "CuTe DSL: using prebuilt tarball (CMake auto-extracts)")
 
     build_cmd = ' && '.join([
         f'mkdir -p {build_dir}', f'cd {build_dir}', ' '.join(cmake_cmd),

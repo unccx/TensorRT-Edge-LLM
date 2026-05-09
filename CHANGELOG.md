@@ -1,5 +1,23 @@
 # Release Notes
 
+## 0.7.0
+- Added Qwen3.5 LLM/VLM support
+- Added Nemotron-Omni support
+- Added Nemotron-3-Nano-30B-A3B NVFP4 MoE support
+- Promoted the checkpoint-based `llm_loader` export path, including dynamic LoRA insertion and adapter weight processing
+- Added a standalone quantization package for `llm_loader` checkpoints
+- Added experimental high-level Python API and OpenAI-compatible server with streaming and EAGLE support
+- Added FP8 embedding support to reduce embedding-table memory
+- Reduced runtime memory by sharing TensorRT execution context memory
+- Unified LLM runtime execution paths
+- Added per-slot streaming with the `StreamChannel` API
+- Improved build workflow with automatic TensorRT detection
+- Upgraded Transformers support to 5.x
+
+## 0.6.1
+- Added DriveOS 7.2.4 official support
+- Fixed EAGLE draft model weights loading issue to retrieve acceptance rate
+
 ## 0.6.0
 - Added Nemotron-Nano-9B-v2 support via mamba_ssm and causal_conv1d
 - Added Qwen3-30B-A3B-GPTQ-Int4 support via INT4 MoE Plugin
